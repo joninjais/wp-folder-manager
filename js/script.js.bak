@@ -1,0 +1,866 @@
+jQuery(document).ready(function($) {
+    'use strict';
+    
+    // ตัวแปร
+    let currentFolderId = null;
+    let selectedFiles = new Set();
+    let wpMediaFrame = null;
+    
+    // ตรวจสอบว่าอยู่ในหน้า Folder Manager หรือ Media Library
+    const isMediaLibrary = $('body').hasClass('upload-php');
+    const isFolderManager = $('.wpfm-wrap').length > 0;
+    
+    // ถ้าอยู่ใน Media Library และมี Folders plugin ให้ข้าม
+    if (isMediaLibrary && typeof folders_media_options !== 'undefined') {
+        console.log('WP Folder Manager: Folders plugin detected, skipping to avoid conflict');
+        return;
+    }
+    
+    // ฟังก์ชันสำหรับ Folder Manager Page เท่านั้น
+    if (isFolderManager) {
+        initFolderManager();
+    }
+    
+    // ฟังก์ชันสำหรับ Media Library เท่านั้น
+    if (isMediaLibrary) {
+        initMediaLibrarySidebar();
+    }
+    
+    function initFolderManager() {
+        resetForm();
+        $('#wpfm-modal-title').text('สร้าง Folder ใหม่');
+        $('#wpfm-folder-modal').fadeIn();
+    });
+    
+    // เพิ่ม Subfolder
+    $(document).on('click', '.wpfm-add-subfolder', function(e) {
+        e.stopPropagation();
+        const parentId = $(this).data('folder-id');
+        resetForm();
+        $('#wpfm-parent-id').val(parentId);
+        $('#wpfm-modal-title').text('สร้าง Subfolder');
+        $('#wpfm-folder-modal').fadeIn();
+    });
+    
+    // แก้ไข Folder
+    $(document).on('click', '.wpfm-edit-folder', function(e) {
+        e.stopPropagation();
+        const folderId = $(this).data('folder-id');
+        
+        $.ajax({
+            url: wpfm_ajax.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'wpfm_get_folder',
+                nonce: wpfm_ajax.nonce,
+                id: folderId
+            },
+            success: function(response) {
+                if (response.success) {
+                    const folder = response.data;
+                    $('#wpfm-folder-id').val(folder.id);
+                    $('#wpfm-folder-name').val(folder.name);
+                    $('#wpfm-parent-id').val(folder.parent_id);
+                    $('input[name="icon"][value="' + folder.icon + '"]').prop('checked', true);
+                    $('#wpfm-folder-color').val(folder.color);
+                    $('#wpfm-modal-title').text('แก้ไข Folder');
+                    $('#wpfm-folder-modal').fadeIn();
+                }
+            }
+        });
+    });
+    
+    // ลบ Folder
+    $(document).on('click', '.wpfm-delete-folder', function(e) {
+        e.stopPropagation();
+        const folderId = $(this).data('folder-id');
+        
+        if (!confirm('คุณต้องการลบ folder นี้หรือไม่?\n(ไฟล์ภายในจะไม่ถูกลบ เพียงแต่ยกเลิกการจัดกลุ่ม)')) {
+            return;
+        }
+        
+        $.ajax({
+            url: wpfm_ajax.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'wpfm_delete_folder',
+                nonce: wpfm_ajax.nonce,
+                id: folderId
+            },
+            success: function(response) {
+                if (response.success) {
+                    showNotification(response.data, 'success');
+                    setTimeout(() => refreshFolderTree(), 1000);
+                } else {
+                    showNotification(response.data, 'error');
+                }
+            }
+        });
+    });
+    
+    // บันทึก Folder
+    $('#wpfm-folder-form').on('submit', function(e) {
+        e.preventDefault();
+        
+        const folderId = $('#wpfm-folder-id').val();
+        const action = folderId ? 'wpfm_update_folder' : 'wpfm_create_folder';
+        
+        const data = {
+            action: action,
+            nonce: wpfm_ajax.nonce,
+            id: folderId,
+            name: $('#wpfm-folder-name').val(),
+            parent_id: $('#wpfm-parent-id').val(),
+            icon: $('input[name="icon"]:checked').val(),
+            color: $('#wpfm-folder-color').val()
+        };
+        
+        $.ajax({
+            url: wpfm_ajax.ajax_url,
+            type: 'POST',
+            data: data,
+            success: function(response) {
+                if (response.success) {
+                    showNotification(folderId ? 'อัพเดทสำเร็จ' : 'สร้างสำเร็จ', 'success');
+                    setTimeout(() => {
+                        $('#wpfm-folder-modal').fadeOut();
+                        refreshFolderTree();
+                    }, 1000);
+                } else {
+                    showNotification(response.data, 'error');
+                }
+            }
+        });
+    });
+    
+    // ปิด Modal
+    $('.wpfm-close, .wpfm-cancel').on('click', function() {
+        $('#wpfm-folder-modal, #wpfm-move-modal').fadeOut();
+    });
+    
+    // Toggle Subfolder
+    $(document).on('click', '.wpfm-toggle', function(e) {
+        e.stopPropagation();
+        $(this).toggleClass('open');
+        $(this).closest('.wpfm-folder-item').find('> .wpfm-subfolder').slideToggle(200);
+    });
+    
+    // คลิกที่ Folder เพื่อดูไฟล์
+    $(document).on('click', '.wpfm-folder-row', function() {
+        $('.wpfm-folder-row').removeClass('active');
+        $(this).addClass('active');
+        
+        const folderId = $(this).closest('.wpfm-folder-item').data('folder-id');
+        const folderName = $(this).find('.wpfm-folder-name').text();
+        currentFolderId = folderId;
+        
+        $('#wpfm-current-folder').text(folderName);
+        
+        selectedFiles.clear();
+        updateSelectedCount();
+        
+        loadFolderFiles(folderId);
+    });
+    
+    // ปุ่มอัพโหลดไฟล์
+    $('#wpfm-upload-files').on('click', function() {
+        console.log('Upload button clicked, currentFolderId:', currentFolderId);
+        if (!currentFolderId) {
+            if (!confirm('คุณยังไม่ได้เลือก folder\nต้องการอัพโหลดไฟล์โดยไม่จัดเข้า folder หรือไม่?\n(ไฟล์จะถูกเพิ่มเข้า Media Library ปกติ)')) {
+                return;
+            }
+        }
+        $('#wpfm-file-input').click();
+    });
+    
+    // เมื่อเลือกไฟล์จาก input
+    $('#wpfm-file-input').on('change', function() {
+        const files = this.files;
+        if (files.length > 0) {
+            uploadFiles(files);
+        }
+    });
+    
+    // อัพโหลดไฟล์
+    function uploadFiles(files) {
+        const formData = new FormData();
+        formData.append('action', 'wpfm_upload_files');
+        formData.append('nonce', wpfm_ajax.nonce);
+        formData.append('folder_id', currentFolderId);
+        
+        for (let i = 0; i < files.length; i++) {
+            formData.append('files[]', files[i]);
+        }
+        
+        $('#wpfm-upload-progress').show();
+        $('#wpfm-progress-fill').css('width', '0%');
+        $('#wpfm-progress-text').text('0%');
+        
+        $.ajax({
+            url: wpfm_ajax.ajax_url,
+            type: 'POST',
+            data: formData,
+            processData: false,
+            contentType: false,
+            xhr: function() {
+                const xhr = new window.XMLHttpRequest();
+                xhr.upload.addEventListener('progress', function(e) {
+                    if (e.lengthComputable) {
+                        const percent = Math.round((e.loaded / e.total) * 100);
+                        $('#wpfm-progress-fill').css('width', percent + '%');
+                        $('#wpfm-progress-text').text(percent + '%');
+                    }
+                }, false);
+                return xhr;
+            },
+            success: function(response) {
+                if (response.success) {
+                    const data = response.data;
+                    let statusMsg = `อัพโหลดสำเร็จ ${data.success_count}/${data.total} ไฟล์`;
+                    if (data.errors.length > 0) {
+                        statusMsg += '<br>ข้อผิดพลาด: ' + data.errors.join(', ');
+                    }
+                    $('#wpfm-upload-status').html(statusMsg);
+                    
+                    showNotification('อัพโหลดสำเร็จ!', 'success');
+                    
+                    setTimeout(() => {
+                        $('#wpfm-upload-progress').fadeOut();
+                        $('#wpfm-file-input').val('');
+                        loadFolderFiles(currentFolderId);
+                        updateFolderBadge(currentFolderId);
+                    }, 2000);
+                } else {
+                    showNotification(response.data, 'error');
+                    $('#wpfm-upload-progress').fadeOut();
+                }
+            },
+            error: function() {
+                showNotification('เกิดข้อผิดพลาดในการอัพโหลด', 'error');
+                $('#wpfm-upload-progress').fadeOut();
+            }
+        });
+    }
+    
+    // เลือกจาก Media Library
+    $('#wpfm-select-from-library').on('click', function() {
+        if (!currentFolderId) {
+            alert('กรุณาเลือก folder ก่อน');
+            return;
+        }
+        
+        if (wpMediaFrame) {
+            wpMediaFrame.open();
+            return;
+        }
+        
+        wpMediaFrame = wp.media({
+            title: 'เลือกไฟล์จาก Media Library',
+            button: {
+                text: 'เพิ่มเข้า Folder'
+            },
+            multiple: true
+        });
+        
+        wpMediaFrame.on('select', function() {
+            const selection = wpMediaFrame.state().get('selection');
+            const fileIds = selection.map(attachment => attachment.id);
+            
+            $.ajax({
+                url: wpfm_ajax.ajax_url,
+                type: 'POST',
+                data: {
+                    action: 'wpfm_add_to_folder',
+                    nonce: wpfm_ajax.nonce,
+                    folder_id: currentFolderId,
+                    file_ids: fileIds
+                },
+                success: function(response) {
+                    if (response.success) {
+                        showNotification(response.data.message, 'success');
+                        loadFolderFiles(currentFolderId);
+                        updateFolderBadge(currentFolderId);
+                    } else {
+                        showNotification(response.data, 'error');
+                    }
+                }
+            });
+        });
+        
+        wpMediaFrame.open();
+    });
+    
+    // ดึงไฟล์ใน Folder
+    function loadFolderFiles(folderId) {
+        $.ajax({
+            url: wpfm_ajax.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'wpfm_get_folder_files',
+                nonce: wpfm_ajax.nonce,
+                folder_id: folderId
+            },
+            success: function(response) {
+                if (response.success) {
+                    displayFiles(response.data);
+                }
+            }
+        });
+    }
+    
+    // แสดงไฟล์
+    function displayFiles(files) {
+        const $fileList = $('#wpfm-file-list');
+        $fileList.empty();
+        
+        if (files.length === 0) {
+            $fileList.html('<p class="wpfm-empty-state">ไม่มีไฟล์ใน folder นี้<br>คลิก "อัพโหลดไฟล์" เพื่อเพิ่มไฟล์</p>');
+            return;
+        }
+        
+        files.forEach(function(file) {
+            const $item = $('<div class="wpfm-file-item" data-file-id="' + file.id + '" draggable="true">');
+            
+            // Checkbox
+            $item.append('<input type="checkbox" class="wpfm-file-checkbox">');
+            
+            // Thumbnail
+            $item.append('<img src="' + file.thumb + '" class="wpfm-file-thumb" alt="' + file.title + '">');
+            
+            // File Info
+            const $info = $('<div class="wpfm-file-info">');
+            $info.append('<div class="wpfm-file-title" title="' + file.title + '">' + file.title + '</div>');
+            $info.append('<div class="wpfm-file-meta">' + file.size + ' • ' + file.date + '</div>');
+            $item.append($info);
+            
+            // Actions
+            const $actions = $('<div class="wpfm-file-actions">');
+            $actions.append('<button class="wpfm-file-action-btn wpfm-view-file" data-url="' + file.url + '" title="ดู"><span class="dashicons dashicons-visibility"></span></button>');
+            $actions.append('<button class="wpfm-file-action-btn wpfm-delete-file" data-file-id="' + file.id + '" title="ลบ"><span class="dashicons dashicons-trash"></span></button>');
+            $item.append($actions);
+            
+            $fileList.append($item);
+        });
+        
+        // Initialize drag events for files
+        initFileDragEvents();
+    }
+    
+    // เลือก/ยกเลิกเลือกไฟล์
+    $(document).on('change', '.wpfm-file-checkbox', function() {
+        const $item = $(this).closest('.wpfm-file-item');
+        const fileId = $item.data('file-id');
+        
+        if ($(this).is(':checked')) {
+            $item.addClass('selected');
+            selectedFiles.add(fileId);
+        } else {
+            $item.removeClass('selected');
+            selectedFiles.delete(fileId);
+        }
+        
+        updateSelectedCount();
+    });
+    
+    // อัพเดทจำนวนไฟล์ที่เลือก
+    function updateSelectedCount() {
+        const count = selectedFiles.size;
+        $('#wpfm-selected-count').text(count);
+        
+        console.log('Selected files count:', count);
+        console.log('Move button exists:', $('#wpfm-move-selected').length);
+        
+        if (count > 0) {
+            $('#wpfm-move-selected').show();
+            $('#wpfm-delete-selected').show();
+            console.log('Showing move and delete buttons');
+        } else {
+            $('#wpfm-move-selected').hide();
+            $('#wpfm-delete-selected').hide();
+            console.log('Hiding move and delete buttons');
+        }
+    }
+    
+    // เปิด Modal ย้ายไฟล์
+    $('#wpfm-move-selected').on('click', function() {
+        if (selectedFiles.size === 0) {
+            return;
+        }
+        
+        $('#wpfm-move-count').text(selectedFiles.size);
+        $('#wpfm-target-folder').val('');
+        $('#wpfm-move-modal').fadeIn();
+    });
+    
+    // ยืนยันการย้ายไฟล์
+    $('#wpfm-confirm-move').on('click', function() {
+        const targetFolderId = $('#wpfm-target-folder').val();
+        
+        if (!targetFolderId) {
+            alert('กรุณาเลือก folder ปลายทาง');
+            return;
+        }
+        
+        if (selectedFiles.size === 0) {
+            return;
+        }
+        
+        const fileIds = Array.from(selectedFiles);
+        
+        $.ajax({
+            url: wpfm_ajax.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'wpfm_move_files',
+                nonce: wpfm_ajax.nonce,
+                file_ids: fileIds,
+                target_folder_id: targetFolderId
+            },
+            success: function(response) {
+                if (response.success) {
+                    showNotification(response.data.message, 'success');
+                    $('#wpfm-move-modal').fadeOut();
+                    selectedFiles.clear();
+                    updateSelectedCount();
+                    
+                    if (currentFolderId) {
+                        loadFolderFiles(currentFolderId);
+                        updateFolderBadge(currentFolderId);
+                    }
+                } else {
+                    showNotification(response.data || 'เกิดข้อผิดพลาดในการย้ายไฟล์', 'error');
+                }
+            },
+            error: function() {
+                showNotification('เกิดข้อผิดพลาดในการเชื่อมต่อ', 'error');
+            }
+        });
+    });
+    
+    // ลบไฟล์ที่เลือก
+    $('#wpfm-delete-selected').on('click', function() {
+        if (selectedFiles.size === 0) {
+            return;
+        }
+        
+        if (!confirm(`คุณต้องการลบไฟล์ ${selectedFiles.size} ไฟล์หรือไม่?\n(ไฟล์จะถูกลบออกจากระบบอย่างถาวร)`)) {
+            return;
+        }
+        
+        deleteFiles(Array.from(selectedFiles));
+    });
+    
+    // ลบไฟล์เดี่ยว
+    $(document).on('click', '.wpfm-delete-file', function(e) {
+        e.stopPropagation();
+        const fileId = $(this).data('file-id');
+        
+        if (!confirm('คุณต้องการลบไฟล์นี้หรือไม่?\n(ไฟล์จะถูกลบออกจากระบบอย่างถาวร)')) {
+            return;
+        }
+        
+        deleteFiles([fileId]);
+    });
+    
+    // ฟังก์ชันลบไฟล์
+    function deleteFiles(fileIds) {
+        $.ajax({
+            url: wpfm_ajax.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'wpfm_delete_files',
+                nonce: wpfm_ajax.nonce,
+                file_ids: fileIds
+            },
+            success: function(response) {
+                if (response.success) {
+                    showNotification(response.data.message, 'success');
+                    selectedFiles.clear();
+                    updateSelectedCount();
+                    loadFolderFiles(currentFolderId);
+                    updateFolderBadge(currentFolderId);
+                } else {
+                    showNotification(response.data, 'error');
+                }
+            }
+        });
+    }
+    
+    // ดูไฟล์
+    $(document).on('click', '.wpfm-view-file', function(e) {
+        e.stopPropagation();
+        const url = $(this).data('url');
+        window.open(url, '_blank');
+    });
+    
+    // Drag and Drop สำหรับย้ายไฟล์ระหว่าง Folder
+    function initFileDragEvents() {
+        // เมื่อเริ่ม drag ไฟล์
+        $('.wpfm-file-item').on('dragstart', function(e) {
+            const fileId = $(this).data('file-id');
+            e.originalEvent.dataTransfer.setData('text/plain', fileId);
+            e.originalEvent.dataTransfer.effectAllowed = 'move';
+            $(this).addClass('dragging');
+            
+            // เพิ่มคลาส drag-active ให้ folder ทั้งหมด
+            $('.wpfm-folder-row').addClass('drop-zone-active');
+        });
+        
+        // เมื่อจบการ drag
+        $('.wpfm-file-item').on('dragend', function(e) {
+            $(this).removeClass('dragging');
+            $('.wpfm-folder-row').removeClass('drop-zone-active drag-over');
+        });
+    }
+    
+    // Folder Drop Zone
+    $(document).on('dragover', '.wpfm-folder-row', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        if ($('.wpfm-file-item.dragging').length > 0) {
+            $(this).addClass('drag-over');
+            e.originalEvent.dataTransfer.dropEffect = 'move';
+        }
+    });
+    
+    $(document).on('dragleave', '.wpfm-folder-row', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        $(this).removeClass('drag-over');
+    });
+    
+    $(document).on('drop', '.wpfm-folder-row', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        $(this).removeClass('drag-over');
+        $('.wpfm-folder-row').removeClass('drop-zone-active');
+        
+        const fileId = e.originalEvent.dataTransfer.getData('text/plain');
+        const targetFolderId = $(this).closest('.wpfm-folder-item').data('folder-id');
+        
+        if (fileId && targetFolderId) {
+            moveFileToFolder(fileId, targetFolderId);
+        }
+    });
+    
+    // ฟังก์ชันย้ายไฟล์ไปยัง Folder
+    function moveFileToFolder(fileId, targetFolderId) {
+        $.ajax({
+            url: wpfm_ajax.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'wpfm_move_file',
+                nonce: wpfm_ajax.nonce,
+                file_id: fileId,
+                target_folder_id: targetFolderId
+            },
+            success: function(response) {
+                if (response.success) {
+                    showNotification('ย้ายไฟล์สำเร็จ', 'success');
+                    // รีโหลดไฟล์ใน folder ปัจจุบัน
+                    if (currentFolderId) {
+                        loadFolderFiles(currentFolderId);
+                        updateFolderBadge(currentFolderId);
+                    }
+                    // อัพเดทจำนวนไฟล์ของ folder ปลายทาง
+                    updateFolderBadge(targetFolderId);
+                } else {
+                    showNotification(response.data || 'เกิดข้อผิดพลาดในการย้ายไฟล์', 'error');
+                }
+            },
+            error: function() {
+                showNotification('เกิดข้อผิดพลาดในการเชื่อมต่อ', 'error');
+            }
+        });
+    }
+    
+    // Drag and Drop สำหรับอัพโหลดไฟล์จากภายนอก
+    const $fileList = $('#wpfm-file-list');
+    
+    $fileList.on('dragover', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        
+        // ไม่แสดง drag-over ถ้าเป็น internal drag (กำลังลากไฟล์ภายในระบบ)
+        if ($('.wpfm-file-item.dragging').length > 0) {
+            return;
+        }
+        
+        if (currentFolderId) {
+            $(this).addClass('drag-over');
+        }
+    });
+    
+    $fileList.on('dragleave', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        $(this).removeClass('drag-over');
+    });
+    
+    $fileList.on('drop', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        $(this).removeClass('drag-over');
+        
+        // ถ้าเป็น internal drag (กำลังลากไฟล์ภายในระบบ) ให้ยกเลิกการอัพโหลด
+        if ($('.wpfm-file-item.dragging').length > 0) {
+            console.log('Internal drag detected, ignoring drop on file list');
+            return;
+        }
+        
+        if (!currentFolderId) {
+            if (!confirm('คุณยังไม่ได้เลือก folder\nต้องการอัพโหลดไฟล์โดยไม่จัดเข้า folder หรือไม่?')) {
+                return;
+            }
+        }
+        
+        const files = e.originalEvent.dataTransfer.files;
+        if (files.length > 0) {
+            console.log('External files detected, uploading:', files.length);
+            uploadFiles(files);
+        }
+    });
+    
+    // Notification
+    function showNotification(message, type = 'success') {
+        const $notification = $('<div class="wpfm-notification wpfm-notification-' + type + '">' + message + '</div>');
+        $('body').append($notification);
+        
+        setTimeout(() => {
+            $notification.addClass('show');
+        }, 100);
+        
+        setTimeout(() => {
+            $notification.removeClass('show');
+            setTimeout(() => $notification.remove(), 300);
+        }, 3000);
+    }
+    
+    // CSS สำหรับ Notification และ Drag & Drop
+    if ($('.wpfm-notification-style').length === 0) {
+        $('head').append(`
+            <style class="wpfm-notification-style">
+                .wpfm-notification {
+                    position: fixed;
+                    top: 50px;
+                    right: -300px;
+                    padding: 15px 20px;
+                    background: white;
+                    border-radius: 5px;
+                    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+                    z-index: 999999;
+                    transition: right 0.3s;
+                    max-width: 300px;
+                }
+                .wpfm-notification.show {
+                    right: 20px;
+                }
+                .wpfm-notification-success {
+                    border-left: 4px solid #46b450;
+                }
+                .wpfm-notification-error {
+                    border-left: 4px solid #dc3232;
+                }
+                
+                /* Drag and Drop Styles */
+                .wpfm-file-item {
+                    cursor: move;
+                }
+                .wpfm-file-item.dragging {
+                    opacity: 0.5;
+                }
+                .wpfm-folder-row.drop-zone-active {
+                    transition: background-color 0.2s;
+                }
+                .wpfm-folder-row.drag-over {
+                    background-color: #e8f5e9 !important;
+                    border-left: 3px solid #46b450;
+                }
+                .wpfm-folder-row.drop-zone-active::after {
+                    content: '📥';
+                    position: absolute;
+                    right: 10px;
+                    opacity: 0.3;
+                    font-size: 16px;
+                }
+            </style>
+        `);
+    }
+    
+    // รีเซ็ตฟอร์ม
+    function resetForm() {
+        $('#wpfm-folder-form')[0].reset();
+        $('#wpfm-folder-id').val('');
+        $('#wpfm-parent-id').val('0');
+        $('#wpfm-folder-color').val('#FFA500');
+    }
+    
+    // อัพเดทจำนวนไฟล์ใน folder badge
+    function updateFolderBadge(folderId) {
+        if (!folderId) return;
+        
+        $.ajax({
+            url: wpfm_ajax.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'wpfm_get_folder_file_count',
+                nonce: wpfm_ajax.nonce,
+                folder_id: folderId
+            },
+            success: function(response) {
+                if (response.success) {
+                    const $folderItem = $('.wpfm-folder-item[data-folder-id="' + folderId + '"]');
+                    $folderItem.find('.wpfm-file-badge').first().text(response.data.count);
+                }
+            }
+        });
+    }
+    
+    // รีเฟรช folder tree โดยไม่ reload หน้า
+    function refreshFolderTree() {
+        $.ajax({
+            url: wpfm_ajax.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'wpfm_get_folder_tree',
+                nonce: wpfm_ajax.nonce
+            },
+            success: function(response) {
+                if (response.success) {
+                    $('#wpfm-folder-tree').html(response.data.html);
+                    
+                    // ถ้ามี folder ที่เลือกอยู่ ให้เลือกอีกครั้ง
+                    if (currentFolderId) {
+                        const $currentFolder = $('.wpfm-folder-item[data-folder-id="' + currentFolderId + '"]');
+                        $currentFolder.find('.wpfm-folder-row').first().addClass('active');
+                    }
+                }
+            }
+        });
+    }
+    
+    // ==========================================
+    // Toggle Sidebar สำหรับหน้า Media Library
+    // ==========================================
+    
+    // ตรวจสอบว่ามี WP Folder Manager sidebar หรือไม่
+    if ($('#wpfm-media-sidebar').length === 0) {
+        // ถ้าไม่มี sidebar (อาจจะถูกซ่อนเพราะมี Folders plugin)
+        console.log('WP Folder Manager: Sidebar not found (may be using Folders plugin instead)');
+        return;
+    }
+    
+    // จัดการ Toggle Button ในหน้า Media Library
+    $('.wpfm-toggle-btn').on('click', function() {
+        const $btn = $(this);
+        const $container = $('#wpfm-media-toggle-container');
+        const $sidebar = $('#wpfm-media-sidebar');
+        const isHideBtn = $btn.hasClass('wpfm-hide-sidebar');
+        const newStatus = isHideBtn ? 'hide' : 'show';
+        
+        // Toggle active class
+        $('.wpfm-toggle-btn').removeClass('active');
+        $btn.addClass('active');
+        
+        // Toggle container and sidebar class
+        if (isHideBtn) {
+            $container.addClass('wpfm-sidebar-hidden');
+            $sidebar.addClass('wpfm-sidebar-hidden');
+            $('body').addClass('wpfm-sidebar-hidden-body');
+        } else {
+            $container.removeClass('wpfm-sidebar-hidden');
+            $sidebar.removeClass('wpfm-sidebar-hidden');
+            $('body').removeClass('wpfm-sidebar-hidden-body');
+        }
+        
+        // บันทึกสถานะลง database
+        $.ajax({
+            url: wpfm_ajax.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'wpfm_toggle_sidebar',
+                nonce: wpfm_ajax.nonce,
+                status: newStatus
+            },
+            success: function(response) {
+                if (response.success) {
+                    console.log('Sidebar status saved:', newStatus);
+                }
+            },
+            error: function() {
+                console.error('Failed to save sidebar status');
+            }
+        });
+    });
+    
+    // จัดการคลิกที่ folder item ในหน้า Media Library
+    $(document).on('click', '.wpfm-folder-item-media', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        
+        const $item = $(this);
+        const folderId = $item.data('folder-id');
+        
+        // ถ้าคลิกที่ arrow toggle subfolder
+        if ($(e.target).hasClass('wpfm-toggle-arrow') && !$(e.target).hasClass('wpfm-no-children')) {
+            const $arrow = $(e.target);
+            const $subfolder = $item.next('.wpfm-subfolder-container');
+            
+            $arrow.toggleClass('open');
+            $subfolder.slideToggle(200);
+            return;
+        }
+        
+        // Highlight folder ที่เลือก
+        $('.wpfm-folder-item-media').removeClass('active');
+        $item.addClass('active');
+        
+        // Filter files ใน Media Library
+        filterMediaByFolder(folderId);
+    });
+    
+    // ฟังก์ชัน filter files ตาม folder
+    function filterMediaByFolder(folderId) {
+        console.log('Filtering by folder:', folderId);
+        
+        // สำหรับ Grid View (Modal)
+        if (typeof wp !== 'undefined' && wp.media && wp.media.frame && wp.media.frame.content) {
+            const content = wp.media.frame.content.get();
+            if (content && content.collection) {
+                content.collection.props.set({
+                    wpfm_folder: folderId
+                });
+                content.collection.fetch();
+            }
+        }
+        
+        // สำหรับ List View - Reload หน้าด้วย query parameter
+        if ($('.wp-list-table.media').length || $('body').hasClass('upload-php')) {
+            const currentUrl = window.location.href;
+            const newUrl = updateQueryStringParameter(currentUrl, 'wpfm_folder', folderId);
+            
+            if (currentUrl !== newUrl) {
+                window.location.href = newUrl;
+            }
+        }
+    }
+    
+    // Helper function: อัพเดท query string parameter
+    function updateQueryStringParameter(uri, key, value) {
+        const re = new RegExp("([?&])" + key + "=.*?(&|$)", "i");
+        const separator = uri.indexOf('?') !== -1 ? "&" : "?";
+        
+        if (uri.match(re)) {
+            return uri.replace(re, '$1' + key + "=" + value + '$2');
+        } else {
+            return uri + separator + key + "=" + value;
+        }
+    }
+    
+    // เปิดหน้าสร้าง folder จาก Media Library sidebar
+    $('#wpfm-media-create-folder').on('click', function(e) {
+        e.preventDefault();
+        // เปิดหน้า Folder Manager ใน tab ใหม่
+        window.open(wpfm_ajax.folder_manager_url || 'admin.php?page=wp-folder-manager', '_blank');
+    });
+});
